@@ -928,31 +928,65 @@ async def shopify_create_webhook(params: CreateWebhookInput) -> str:
     except Exception as e:
         return _error(e)
 
+
 # ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
 import uvicorn
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
 from starlette.responses import Response
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+from slowapi.middleware import SlowAPIASGIMiddleware
+from slowapi.errors import RateLimitExceeded
 
-BEARER_TOKEN = os.environ.get("BEARER_TOKEN", "")
+BEARER_TOKEN  = os.environ.get("BEARER_TOKEN", "")
+RATE_LIMIT    = os.environ.get("RATE_LIMIT", "60/minute")  # Configurable via env
+
+
+def _get_client_ip(request: Request) -> str:
+    """Extraer IP real considerando Railway/proxies."""
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
 
 class BearerAuthMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request, call_next):
+    async def dispatch(self, request: Request, call_next):
         if BEARER_TOKEN:
-            # Aceptar token por header O por query param
-            auth = request.headers.get("Authorization", "")
+            auth        = request.headers.get("Authorization", "")
             token_param = request.query_params.get("token", "")
-            
+
             valid_header = auth == f"Bearer {BEARER_TOKEN}"
             valid_param  = token_param == BEARER_TOKEN
-            
+
+            if valid_param and not valid_header:
+                # Token en URL es funcional pero menos seguro — advertir en logs
+                ip = _get_client_ip(request)
+                logger.warning(f"Auth via query param desde {ip} — migrar a header Authorization")
+
             if not valid_header and not valid_param:
+                ip = _get_client_ip(request)
+                logger.warning(f"Acceso no autorizado desde {ip} {request.method} {request.url.path}")
                 return Response("Unauthorized", status_code=401)
+
         return await call_next(request)
 
+
+# Rate limiter — clave por IP real
+limiter = Limiter(key_func=_get_client_ip, default_limits=[RATE_LIMIT])
+
 app = mcp.streamable_http_app()
+app.state.limiter = limiter
+
+# Orden de middlewares: rate limit primero, luego auth
+app.add_middleware(SlowAPIASGIMiddleware)
 app.add_middleware(BearerAuthMiddleware)
+
+logger.info(f"Rate limit: {RATE_LIMIT} por IP")
+logger.info(f"Bearer auth: {'habilitado' if BEARER_TOKEN else 'DESHABILITADO — servidor abierto'}")
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=PORT)
