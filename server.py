@@ -940,8 +940,14 @@ BEARER_TOKEN = os.environ.get("BEARER_TOKEN", "")
 class BearerAuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
         if BEARER_TOKEN:
+            # Aceptar token por header O por query param
             auth = request.headers.get("Authorization", "")
-            if auth != f"Bearer {BEARER_TOKEN}":
+            token_param = request.query_params.get("token", "")
+            
+            valid_header = auth == f"Bearer {BEARER_TOKEN}"
+            valid_param  = token_param == BEARER_TOKEN
+            
+            if not valid_header and not valid_param:
                 return Response("Unauthorized", status_code=401)
         return await call_next(request)
 
