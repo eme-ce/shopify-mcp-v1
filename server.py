@@ -26,11 +26,10 @@ from mcp.server.fastmcp import FastMCP
 # Configuration
 # ---------------------------------------------------------------------------
 
-SHOPIFY_STORE         = os.environ.get("SHOPIFY_STORE", "")           # e.g. "my-store"
-SHOPIFY_TOKEN         = os.environ.get("SHOPIFY_ACCESS_TOKEN", "")    # Static token (shpat_...)
-SHOPIFY_CLIENT_ID     = os.environ.get("SHOPIFY_CLIENT_ID", "")
-SHOPIFY_CLIENT_SECRET = os.environ.get("SHOPIFY_CLIENT_SECRET", "")
-API_VERSION           = os.environ.get("SHOPIFY_API_VERSION", "2024-10")
+SHOPIFY_STORE = os.environ.get("SHOPIFY_STORE", "")
+API_VERSION   = os.environ.get("SHOPIFY_API_VERSION", "2024-10")
+# Credentials are NOT stored as module globals — they are read from os.environ
+# only at the moment of use inside TokenManager to minimize secret lifetime in memory.
 
 # Refresh buffer: refresh token 30 minutes before expiry (only used with OAuth)
 TOKEN_REFRESH_BUFFER = int(os.environ.get("TOKEN_REFRESH_BUFFER", "1800"))
@@ -57,25 +56,23 @@ class TokenManager:
       1. Static token  — set SHOPIFY_ACCESS_TOKEN (recommended for Custom Apps)
       2. OAuth / client_credentials — set SHOPIFY_CLIENT_ID + SHOPIFY_CLIENT_SECRET
          Enables auto-refresh before expiry and retry on 401.
+
+    Credentials are read from os.environ at the point of use and are never stored
+    as instance attributes, minimising their lifetime in process memory.
     """
 
-    def __init__(
-        self,
-        store: str,
-        client_id: str,
-        client_secret: str,
-        static_token: str = "",
-        refresh_buffer: int = 1800,
-    ):
+    def __init__(self, store: str, refresh_buffer: int = 1800):
         self._store          = store
-        self._client_id      = client_id
-        self._client_secret  = client_secret
-        self._static_token   = static_token
         self._refresh_buffer = refresh_buffer
 
-        self._access_token: str  = ""
-        self._expires_at: float  = 0.0
+        self._access_token: str = ""
+        self._expires_at: float = 0.0
         self._lock = asyncio.Lock()
+
+        # Determine mode from env — store only the boolean flag, not the secrets.
+        client_id    = os.environ.get("SHOPIFY_CLIENT_ID", "")
+        client_secret = os.environ.get("SHOPIFY_CLIENT_SECRET", "")
+        static_token  = os.environ.get("SHOPIFY_ACCESS_TOKEN", "")
 
         self._use_client_credentials = bool(client_id and client_secret)
 
@@ -83,13 +80,14 @@ class TokenManager:
             logger.info("Token mode: client_credentials (auto-refresh enabled)")
         elif static_token:
             logger.info("Token mode: static SHOPIFY_ACCESS_TOKEN (no auto-refresh)")
-            self._access_token = static_token
+            self._access_token = static_token   # copied in; local var is discarded below
             self._expires_at   = float("inf")
         else:
             logger.warning(
                 "No credentials configured. Set SHOPIFY_ACCESS_TOKEN or "
                 "SHOPIFY_CLIENT_ID + SHOPIFY_CLIENT_SECRET."
             )
+        # client_id, client_secret, static_token go out of scope here — not kept on self
 
     @property
     def is_expired(self) -> bool:
@@ -126,6 +124,14 @@ class TokenManager:
         return self._access_token
 
     async def _refresh_token(self) -> None:
+        # Read credentials fresh from env on every refresh — not stored on the instance.
+        client_id     = os.environ.get("SHOPIFY_CLIENT_ID", "")
+        client_secret = os.environ.get("SHOPIFY_CLIENT_SECRET", "")
+        if not client_id or not client_secret:
+            raise RuntimeError(
+                "SHOPIFY_CLIENT_ID or SHOPIFY_CLIENT_SECRET missing from environment."
+            )
+
         url = f"https://{self._store}.myshopify.com/admin/oauth/access_token"
         logger.info("Refreshing Shopify access token via client_credentials grant...")
 
@@ -134,13 +140,12 @@ class TokenManager:
                 url,
                 data={
                     "grant_type":    "client_credentials",
-                    "client_id":     self._client_id,
-                    "client_secret": self._client_secret,
+                    "client_id":     client_id,
+                    "client_secret": client_secret,
                 },
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
                 timeout=15.0,
             )
-
             if resp.status_code != 200:
                 logger.error(f"Token refresh failed ({resp.status_code}): {resp.text[:500]}")
                 raise RuntimeError(
@@ -160,14 +165,12 @@ class TokenManager:
                 f"({expires_in // 3600}h {(expires_in % 3600) // 60}m). "
                 f"Scopes: {scope_preview}"
             )
+        # client_id and client_secret locals go out of scope here
 
 
 # Global token manager
 token_manager = TokenManager(
     store=SHOPIFY_STORE,
-    client_id=SHOPIFY_CLIENT_ID,
-    client_secret=SHOPIFY_CLIENT_SECRET,
-    static_token=SHOPIFY_TOKEN,
     refresh_buffer=TOKEN_REFRESH_BUFFER,
 )
 
