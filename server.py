@@ -1086,4 +1086,7 @@ else:
     logger.info("Token query param: DISABLED (set ALLOW_TOKEN_QUERY_PARAM=1 to enable)")
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    # When token query param is enabled the full URL (including ?token=) appears in
+    # uvicorn's access log lines. Disable access_log so credentials don't land in
+    # Railway / reverse-proxy logs. Auth failures are still logged by BearerAuthMiddleware.
+    uvicorn.run(app, host="0.0.0.0", port=PORT, access_log=not ALLOW_TOKEN_QUERY_PARAM)
