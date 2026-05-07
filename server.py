@@ -16,6 +16,7 @@ import time
 import asyncio
 from typing import Optional, List, Dict, Any
 from enum import Enum
+from urllib.parse import urlparse
 import httpx
 import nh3
 from pydantic import BaseModel, Field, ConfigDict, field_validator
@@ -201,6 +202,9 @@ async def _request(
             "Set it before starting the server."
         )
 
+    if method in ("POST", "PUT", "PATCH", "DELETE") and not _retried:
+        logger.info(f"AUDIT {method} {path}")
+
     url     = f"{_base_url()}/{path}"
     headers = await _headers()
 
@@ -231,19 +235,22 @@ def _error(e: Exception) -> str:
             detail = e.response.json()
         except Exception:
             detail = e.response.text[:500]
+        # Full detail goes to server logs only — not exposed to the MCP caller.
+        logger.error(f"Shopify API error {status}: {json.dumps(detail, default=str)}")
         messages = {
             401: "Authentication failed — check your SHOPIFY_ACCESS_TOKEN (should start with shpat_).",
             403: "Permission denied — your token may be missing required API scopes.",
             404: "Resource not found — double-check the ID.",
-            422: f"Validation error: {json.dumps(detail)}",
+            422: "Validation error — Shopify rejected the request. Check your inputs and server logs.",
             429: "Rate-limited — wait a moment and retry.",
         }
-        return messages.get(status, f"Shopify API error {status}: {json.dumps(detail)}")
+        return messages.get(status, f"Shopify API error {status}. Check server logs for details.")
     if isinstance(e, httpx.TimeoutException):
         return "Request timed out — try again."
     if isinstance(e, RuntimeError):
         return str(e)
-    return f"Unexpected error: {type(e).__name__}: {e}"
+    logger.error(f"Unexpected error: {type(e).__name__}: {e}")
+    return f"Unexpected error: {type(e).__name__}. Check server logs for details."
 
 
 def _fmt(data: Any) -> str:
@@ -939,8 +946,18 @@ async def shopify_list_webhooks(params: ListWebhooksInput) -> str:
 class CreateWebhookInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     topic:   str           = Field(..., description="Webhook topic, e.g. orders/create, products/update")
-    address: str           = Field(..., description="URL to receive the webhook POST")
+    address: str           = Field(..., description="HTTPS URL to receive the webhook POST")
     format:  Optional[str] = Field(default="json", description="json or xml")
+
+    @field_validator("address")
+    @classmethod
+    def must_be_https_with_hostname(cls, v: str) -> str:
+        parsed = urlparse(v)
+        if parsed.scheme != "https":
+            raise ValueError("Webhook address must use HTTPS.")
+        if not parsed.hostname:
+            raise ValueError("Webhook address must have a valid hostname.")
+        return v
 
 
 @mcp.tool(
@@ -971,6 +988,7 @@ from starlette.responses import Response
 BEARER_TOKEN             = os.environ.get("BEARER_TOKEN", "")
 RATE_LIMIT_RPM           = int(os.environ.get("RATE_LIMIT_RPM", "60"))   # requests per minute per IP
 TRUSTED_PROXY_COUNT      = max(0, int(os.environ.get("TRUSTED_PROXY_COUNT", "1")))
+MAX_REQUEST_BODY         = int(os.environ.get("MAX_REQUEST_BODY", str(1 * 1024 * 1024)))  # 1 MB default
 # Token via query param (?token=) is disabled by default — it leaks credentials into
 # server-side access logs (nginx, Railway, etc.). Enable only if your MCP client
 # cannot send Authorization headers (e.g. some Claude.ai integrations).
@@ -1043,6 +1061,12 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
 
         ip = _get_client_ip(request)
+
+        # Reject oversized payloads early — before auth — to prevent OOM via large bodies
+        content_length = request.headers.get("content-length")
+        if content_length and int(content_length) > MAX_REQUEST_BODY:
+            logger.warning(f"Payload too large from {ip}: {content_length} bytes (limit {MAX_REQUEST_BODY})")
+            return Response("Payload Too Large", status_code=413)
 
         # Rate limit — checked before auth to block brute-force attempts
         if await _is_rate_limited(ip):
