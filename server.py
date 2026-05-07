@@ -933,32 +933,16 @@ async def shopify_create_webhook(params: CreateWebhookInput) -> str:
 # Entrypoint
 # ---------------------------------------------------------------------------
 import uvicorn
-from collections import defaultdict
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+from slowapi.middleware import SlowAPIASGIMiddleware
+from slowapi.errors import RateLimitExceeded
 
-BEARER_TOKEN      = os.environ.get("BEARER_TOKEN", "")
-RATE_LIMIT_RPM    = int(os.environ.get("RATE_LIMIT_RPM", "60"))  # requests per minute per IP
-
-# ---------------------------------------------------------------------------
-# In-process rate limiter — sliding window por IP
-# ---------------------------------------------------------------------------
-_rate_limit_store: Dict[str, List[float]] = defaultdict(list)
-_rate_limit_lock  = asyncio.Lock()
-
-
-async def _is_rate_limited(ip: str) -> bool:
-    now    = time.time()
-    window = 60.0
-    async with _rate_limit_lock:
-        hits = _rate_limit_store[ip]
-        # Descartar hits fuera de la ventana
-        _rate_limit_store[ip] = [t for t in hits if now - t < window]
-        if len(_rate_limit_store[ip]) >= RATE_LIMIT_RPM:
-            return True
-        _rate_limit_store[ip].append(now)
-        return False
+BEARER_TOKEN  = os.environ.get("BEARER_TOKEN", "")
+RATE_LIMIT    = os.environ.get("RATE_LIMIT", "60/minute")  # Configurable via env
 
 
 def _get_client_ip(request: Request) -> str:
@@ -971,15 +955,6 @@ def _get_client_ip(request: Request) -> str:
 
 class BearerAuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        ip = _get_client_ip(request)
-
-        # Rate limit — se evalúa antes que auth
-        if await _is_rate_limited(ip):
-            logger.warning(f"Rate limit excedido desde {ip}")
-            return Response("Too Many Requests", status_code=429,
-                            headers={"Retry-After": "60"})
-
-        # Auth
         if BEARER_TOKEN:
             auth        = request.headers.get("Authorization", "")
             token_param = request.query_params.get("token", "")
@@ -988,19 +963,29 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
             valid_param  = token_param == BEARER_TOKEN
 
             if valid_param and not valid_header:
+                # Token en URL es funcional pero menos seguro — advertir en logs
+                ip = _get_client_ip(request)
                 logger.warning(f"Auth via query param desde {ip} — migrar a header Authorization")
 
             if not valid_header and not valid_param:
+                ip = _get_client_ip(request)
                 logger.warning(f"Acceso no autorizado desde {ip} {request.method} {request.url.path}")
                 return Response("Unauthorized", status_code=401)
 
         return await call_next(request)
 
 
+# Rate limiter — clave por IP real
+limiter = Limiter(key_func=_get_client_ip, default_limits=[RATE_LIMIT])
+
 app = mcp.streamable_http_app()
+app.state.limiter = limiter
+
+# Orden de middlewares: rate limit primero, luego auth
+app.add_middleware(SlowAPIASGIMiddleware)
 app.add_middleware(BearerAuthMiddleware)
 
-logger.info(f"Rate limit: {RATE_LIMIT_RPM} req/min por IP")
+logger.info(f"Rate limit: {RATE_LIMIT} por IP")
 logger.info(f"Bearer auth: {'habilitado' if BEARER_TOKEN else 'DESHABILITADO — servidor abierto'}")
 
 if __name__ == "__main__":
