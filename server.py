@@ -24,11 +24,11 @@ from mcp.server.fastmcp import FastMCP
 # Configuration
 # ---------------------------------------------------------------------------
 
-SHOPIFY_STORE        = os.environ.get("SHOPIFY_STORE", "")           # e.g. "my-store"
-SHOPIFY_TOKEN        = os.environ.get("SHOPIFY_ACCESS_TOKEN", "")    # Static token (shpat_...)
-SHOPIFY_CLIENT_ID    = os.environ.get("SHOPIFY_CLIENT_ID", "")
+SHOPIFY_STORE         = os.environ.get("SHOPIFY_STORE", "")           # e.g. "my-store"
+SHOPIFY_TOKEN         = os.environ.get("SHOPIFY_ACCESS_TOKEN", "")    # Static token (shpat_...)
+SHOPIFY_CLIENT_ID     = os.environ.get("SHOPIFY_CLIENT_ID", "")
 SHOPIFY_CLIENT_SECRET = os.environ.get("SHOPIFY_CLIENT_SECRET", "")
-API_VERSION          = os.environ.get("SHOPIFY_API_VERSION", "2024-10")
+API_VERSION           = os.environ.get("SHOPIFY_API_VERSION", "2024-10")
 
 # Refresh buffer: refresh token 30 minutes before expiry (only used with OAuth)
 TOKEN_REFRESH_BUFFER = int(os.environ.get("TOKEN_REFRESH_BUFFER", "1800"))
@@ -63,14 +63,14 @@ class TokenManager:
         static_token: str = "",
         refresh_buffer: int = 1800,
     ):
-        self._store         = store
-        self._client_id     = client_id
-        self._client_secret = client_secret
-        self._static_token  = static_token
+        self._store          = store
+        self._client_id      = client_id
+        self._client_secret  = client_secret
+        self._static_token   = static_token
         self._refresh_buffer = refresh_buffer
 
-        self._access_token: str   = ""
-        self._expires_at: float   = 0.0
+        self._access_token: str  = ""
+        self._expires_at: float  = 0.0
         self._lock = asyncio.Lock()
 
         self._use_client_credentials = bool(client_id and client_secret)
@@ -213,7 +213,7 @@ async def _request(
         )
 
         if resp.status_code == 401 and not _retried and token_manager._use_client_credentials:
-            logger.warning("Got 401 — refreshing token and retrying...")
+            logger.warning("Got 401 from Shopify API — refreshing token and retrying...")
             await token_manager.force_refresh()
             return await _request(method, path, params=params, body=body, _retried=True)
 
@@ -303,12 +303,12 @@ async def shopify_get_product(params: GetProductInput) -> str:
 
 class CreateProductInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    title:        str                        = Field(..., min_length=1, description="Product title")
-    body_html:    Optional[str]              = Field(default=None, description="HTML description")
-    vendor:       Optional[str]              = Field(default=None)
-    product_type: Optional[str]              = Field(default=None)
-    tags:         Optional[str]              = Field(default=None, description="Comma-separated tags")
-    status:       Optional[str]              = Field(default="draft", description="active, archived, or draft")
+    title:        str                            = Field(..., min_length=1, description="Product title")
+    body_html:    Optional[str]                  = Field(default=None, description="HTML description")
+    vendor:       Optional[str]                  = Field(default=None)
+    product_type: Optional[str]                  = Field(default=None)
+    tags:         Optional[str]                  = Field(default=None, description="Comma-separated tags")
+    status:       Optional[str]                  = Field(default="draft", description="active, archived, or draft")
     variants:     Optional[List[Dict[str, Any]]] = Field(default=None, description="Variant objects with price, sku, etc.")
     options:      Optional[List[Dict[str, Any]]] = Field(default=None, description="Product options (Size, Color, etc.)")
     images:       Optional[List[Dict[str, Any]]] = Field(default=None, description="Image objects with src URL")
@@ -829,13 +829,13 @@ async def shopify_list_fulfillments(params: ListFulfillmentsInput) -> str:
 
 class CreateFulfillmentInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    order_id:         int                        = Field(..., description="Order ID to fulfill")
-    location_id:      int                        = Field(..., description="Location ID fulfilling from")
-    tracking_number:  Optional[str]              = Field(default=None)
-    tracking_company: Optional[str]              = Field(default=None, description="e.g. UPS, FedEx, USPS")
-    tracking_url:     Optional[str]              = Field(default=None)
+    order_id:         int                            = Field(..., description="Order ID to fulfill")
+    location_id:      int                            = Field(..., description="Location ID fulfilling from")
+    tracking_number:  Optional[str]                  = Field(default=None)
+    tracking_company: Optional[str]                  = Field(default=None, description="e.g. UPS, FedEx, USPS")
+    tracking_url:     Optional[str]                  = Field(default=None)
     line_items:       Optional[List[Dict[str, Any]]] = Field(default=None, description="Specific line items (omit for all)")
-    notify_customer:  Optional[bool]             = Field(default=True, description="Send shipping notification email")
+    notify_customer:  Optional[bool]                 = Field(default=True, description="Send shipping notification email")
 
 
 @mcp.tool(
@@ -940,9 +940,18 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
 
-BEARER_TOKEN      = os.environ.get("BEARER_TOKEN", "")
-RATE_LIMIT_RPM    = int(os.environ.get("RATE_LIMIT_RPM", "60"))   # requests per minute per IP
+BEARER_TOKEN        = os.environ.get("BEARER_TOKEN", "")
+RATE_LIMIT_RPM      = int(os.environ.get("RATE_LIMIT_RPM", "60"))   # requests per minute per IP
 TRUSTED_PROXY_COUNT = max(0, int(os.environ.get("TRUSTED_PROXY_COUNT", "1")))
+
+# FIX: Fail fast if BEARER_TOKEN is not set — prevents accidentally running open on production.
+# Remove or set ALLOW_OPEN_SERVER=1 to bypass (not recommended).
+if not BEARER_TOKEN and not os.environ.get("ALLOW_OPEN_SERVER"):
+    logger.critical(
+        "BEARER_TOKEN is not set. Refusing to start without authentication. "
+        "Set BEARER_TOKEN in your environment variables, or set ALLOW_OPEN_SERVER=1 to bypass (not recommended)."
+    )
+    sys.exit(1)
 
 # ---------------------------------------------------------------------------
 # In-process rate limiter — sliding window per IP
@@ -950,11 +959,21 @@ TRUSTED_PROXY_COUNT = max(0, int(os.environ.get("TRUSTED_PROXY_COUNT", "1")))
 _rate_limit_store: Dict[str, List[float]] = defaultdict(list)
 _rate_limit_lock  = asyncio.Lock()
 
+# FIX: Cap tracked IPs to prevent unbounded memory growth from IP rotation / bots.
+_MAX_TRACKED_IPS = int(os.environ.get("RATE_LIMIT_MAX_IPS", "10000"))
+
 
 async def _is_rate_limited(ip: str) -> bool:
     now    = time.time()
     window = 60.0
     async with _rate_limit_lock:
+        # FIX: Evitar crecimiento ilimitado del dict — si se supera el límite de IPs
+        # trackeadas, simplemente se permite el request (fail-open) para no bloquear
+        # tráfico legítimo. Cambiar a `return True` para fail-closed si se prefiere.
+        if ip not in _rate_limit_store and len(_rate_limit_store) >= _MAX_TRACKED_IPS:
+            logger.warning(f"Rate limit store full ({_MAX_TRACKED_IPS} IPs). Allowing request from {ip}.")
+            return False
+
         hits = _rate_limit_store[ip]
         _rate_limit_store[ip] = [t for t in hits if now - t < window]
         if len(_rate_limit_store[ip]) >= RATE_LIMIT_RPM:
@@ -1002,14 +1021,22 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         # Auth — timing-safe to prevent timing attacks
         if BEARER_TOKEN:
             auth        = request.headers.get("Authorization", "")
-            token_param = request.query_params.get("token", "")  # Claude.ai sends token here
+            # NOTE: token query param is supported for Claude.ai compatibility.
+            # Be aware that query params may appear in server-side access logs.
+            # Rotate BEARER_TOKEN periodically and ensure Railway log access is restricted.
+            token_param = request.query_params.get("token", "")
             expected    = f"Bearer {BEARER_TOKEN}"
 
-            valid_header = secrets.compare_digest(auth.encode(), expected.encode())
-            valid_param  = secrets.compare_digest(token_param.encode(), BEARER_TOKEN.encode())
+            # FIX: Guard against empty string comparison edge cases before compare_digest
+            valid_header = bool(auth) and secrets.compare_digest(auth, expected)
+            valid_param  = bool(token_param) and secrets.compare_digest(token_param, BEARER_TOKEN)
 
             if not valid_header and not valid_param:
-                logger.warning(f"Unauthorized access attempt from {ip} {request.method} {request.url.path}")
+                # FIX: Log path only (no query string) to avoid token leaking into logs
+                logger.warning(
+                    f"Unauthorized access attempt from {ip} "
+                    f"{request.method} {request.url.path}"  # intentionally omit query string
+                )
                 return Response("Unauthorized", status_code=401)
 
         return await call_next(request)
@@ -1018,8 +1045,8 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
 app = mcp.streamable_http_app()
 app.add_middleware(BearerAuthMiddleware)
 
-logger.info(f"Rate limit: {RATE_LIMIT_RPM} req/min per IP | Trusted proxies: {TRUSTED_PROXY_COUNT}")
-logger.info(f"Bearer auth: {'ENABLED' if BEARER_TOKEN else 'DISABLED — server is open'}")
+logger.info(f"Rate limit: {RATE_LIMIT_RPM} req/min per IP | Max tracked IPs: {_MAX_TRACKED_IPS} | Trusted proxies: {TRUSTED_PROXY_COUNT}")
+logger.info(f"Bearer auth: {'ENABLED' if BEARER_TOKEN else 'DISABLED — server is open (ALLOW_OPEN_SERVER set)'}")
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=PORT)
