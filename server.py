@@ -932,61 +932,94 @@ async def shopify_create_webhook(params: CreateWebhookInput) -> str:
 # ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
+import sys
+import secrets
 import uvicorn
+from collections import defaultdict
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
-from slowapi import Limiter
-from slowapi.util import get_remote_address
-from slowapi.middleware import SlowAPIASGIMiddleware
-from slowapi.errors import RateLimitExceeded
 
-BEARER_TOKEN  = os.environ.get("BEARER_TOKEN", "")
-RATE_LIMIT    = os.environ.get("RATE_LIMIT", "60/minute")  # Configurable via env
+BEARER_TOKEN      = os.environ.get("BEARER_TOKEN", "")
+RATE_LIMIT_RPM    = int(os.environ.get("RATE_LIMIT_RPM", "60"))   # requests per minute per IP
+TRUSTED_PROXY_COUNT = max(0, int(os.environ.get("TRUSTED_PROXY_COUNT", "1")))
+
+# ---------------------------------------------------------------------------
+# In-process rate limiter — sliding window per IP
+# ---------------------------------------------------------------------------
+_rate_limit_store: Dict[str, List[float]] = defaultdict(list)
+_rate_limit_lock  = asyncio.Lock()
+
+
+async def _is_rate_limited(ip: str) -> bool:
+    now    = time.time()
+    window = 60.0
+    async with _rate_limit_lock:
+        hits = _rate_limit_store[ip]
+        _rate_limit_store[ip] = [t for t in hits if now - t < window]
+        if len(_rate_limit_store[ip]) >= RATE_LIMIT_RPM:
+            return True
+        _rate_limit_store[ip].append(now)
+        return False
 
 
 def _get_client_ip(request: Request) -> str:
-    """Extraer IP real considerando Railway/proxies."""
-    forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
+    """Extract real client IP accounting for trusted reverse proxies.
+
+    Takes the IP just before the trusted proxy entries in X-Forwarded-For,
+    preventing IP spoofing via crafted headers.
+    """
+    forwarded = request.headers.get("x-forwarded-for", "")
+    if forwarded and TRUSTED_PROXY_COUNT > 0:
+        ips = [ip.strip() for ip in forwarded.split(",")]
+        idx = max(0, len(ips) - TRUSTED_PROXY_COUNT)
+        return ips[idx] if idx < len(ips) else (request.client.host if request.client else "unknown")
     return request.client.host if request.client else "unknown"
 
 
 class BearerAuthMiddleware(BaseHTTPMiddleware):
+    # MCP OAuth handshake endpoints — must be reachable before auth is established.
+    _PUBLIC_PREFIXES = (
+        "/.well-known/",  # OAuth discovery (RFC 8414)
+        "/register",      # Dynamic Client Registration (RFC 7591)
+        "/authorize",     # Authorization endpoint (RFC 6749)
+        "/token",         # Token endpoint (RFC 6749)
+    )
+
     async def dispatch(self, request: Request, call_next):
+        # Always allow MCP OAuth discovery endpoints
+        if any(request.url.path.startswith(p) for p in self._PUBLIC_PREFIXES):
+            return await call_next(request)
+
+        ip = _get_client_ip(request)
+
+        # Rate limit — checked before auth to block brute-force attempts
+        if await _is_rate_limited(ip):
+            logger.warning(f"Rate limit exceeded from {ip}")
+            return Response("Too Many Requests", status_code=429,
+                            headers={"Retry-After": "60"})
+
+        # Auth — timing-safe to prevent timing attacks
         if BEARER_TOKEN:
             auth        = request.headers.get("Authorization", "")
-            token_param = request.query_params.get("token", "")
+            token_param = request.query_params.get("token", "")  # Claude.ai sends token here
+            expected    = f"Bearer {BEARER_TOKEN}"
 
-            valid_header = auth == f"Bearer {BEARER_TOKEN}"
-            valid_param  = token_param == BEARER_TOKEN
-
-            if valid_param and not valid_header:
-                # Token en URL es funcional pero menos seguro — advertir en logs
-                ip = _get_client_ip(request)
-                logger.warning(f"Auth via query param desde {ip} — migrar a header Authorization")
+            valid_header = secrets.compare_digest(auth.encode(), expected.encode())
+            valid_param  = secrets.compare_digest(token_param.encode(), BEARER_TOKEN.encode())
 
             if not valid_header and not valid_param:
-                ip = _get_client_ip(request)
-                logger.warning(f"Acceso no autorizado desde {ip} {request.method} {request.url.path}")
+                logger.warning(f"Unauthorized access attempt from {ip} {request.method} {request.url.path}")
                 return Response("Unauthorized", status_code=401)
 
         return await call_next(request)
 
 
-# Rate limiter — clave por IP real
-limiter = Limiter(key_func=_get_client_ip, default_limits=[RATE_LIMIT])
-
 app = mcp.streamable_http_app()
-app.state.limiter = limiter
-
-# Orden de middlewares: rate limit primero, luego auth
-app.add_middleware(SlowAPIASGIMiddleware)
 app.add_middleware(BearerAuthMiddleware)
 
-logger.info(f"Rate limit: {RATE_LIMIT} por IP")
-logger.info(f"Bearer auth: {'habilitado' if BEARER_TOKEN else 'DESHABILITADO — servidor abierto'}")
+logger.info(f"Rate limit: {RATE_LIMIT_RPM} req/min per IP | Trusted proxies: {TRUSTED_PROXY_COUNT}")
+logger.info(f"Bearer auth: {'ENABLED' if BEARER_TOKEN else 'DISABLED — server is open'}")
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=PORT)
