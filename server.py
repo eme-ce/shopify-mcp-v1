@@ -17,6 +17,7 @@ import asyncio
 from typing import Optional, List, Dict, Any
 from enum import Enum
 import httpx
+import nh3
 from pydantic import BaseModel, Field, ConfigDict, field_validator
 from mcp.server.fastmcp import FastMCP
 
@@ -249,6 +250,23 @@ def _fmt(data: Any) -> str:
     return json.dumps(data, indent=2, default=str)
 
 
+# ---------------------------------------------------------------------------
+# HTML sanitization — applied to body_html fields before sending to Shopify
+# ---------------------------------------------------------------------------
+
+_ALLOWED_HTML_TAGS = {
+    "p", "br", "b", "i", "strong", "em", "u", "s",
+    "h1", "h2", "h3", "h4", "ul", "ol", "li",
+    "a", "span", "div", "blockquote",
+}
+
+
+def _sanitize_html(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    return nh3.clean(value, tags=_ALLOWED_HTML_TAGS)
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # PRODUCTS
 # ═══════════════════════════════════════════════════════════════════════════
@@ -313,6 +331,11 @@ class CreateProductInput(BaseModel):
     options:      Optional[List[Dict[str, Any]]] = Field(default=None, description="Product options (Size, Color, etc.)")
     images:       Optional[List[Dict[str, Any]]] = Field(default=None, description="Image objects with src URL")
 
+    @field_validator("body_html")
+    @classmethod
+    def sanitize_body_html(cls, v: Optional[str]) -> Optional[str]:
+        return _sanitize_html(v)
+
 
 @mcp.tool(
     name="shopify_create_product",
@@ -342,6 +365,11 @@ class UpdateProductInput(BaseModel):
     tags:         Optional[str]  = Field(default=None)
     status:       Optional[str]  = Field(default=None, description="active, archived, or draft")
     variants:     Optional[List[Dict[str, Any]]] = Field(default=None)
+
+    @field_validator("body_html")
+    @classmethod
+    def sanitize_body_html(cls, v: Optional[str]) -> Optional[str]:
+        return _sanitize_html(v)
 
 
 @mcp.tool(
@@ -940,9 +968,13 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
 
-BEARER_TOKEN        = os.environ.get("BEARER_TOKEN", "")
-RATE_LIMIT_RPM      = int(os.environ.get("RATE_LIMIT_RPM", "60"))   # requests per minute per IP
-TRUSTED_PROXY_COUNT = max(0, int(os.environ.get("TRUSTED_PROXY_COUNT", "1")))
+BEARER_TOKEN             = os.environ.get("BEARER_TOKEN", "")
+RATE_LIMIT_RPM           = int(os.environ.get("RATE_LIMIT_RPM", "60"))   # requests per minute per IP
+TRUSTED_PROXY_COUNT      = max(0, int(os.environ.get("TRUSTED_PROXY_COUNT", "1")))
+# Token via query param (?token=) is disabled by default — it leaks credentials into
+# server-side access logs (nginx, Railway, etc.). Enable only if your MCP client
+# cannot send Authorization headers (e.g. some Claude.ai integrations).
+ALLOW_TOKEN_QUERY_PARAM  = os.environ.get("ALLOW_TOKEN_QUERY_PARAM", "").lower() in ("1", "true", "yes")
 
 # FIX: Fail fast if BEARER_TOKEN is not set — prevents accidentally running open on production.
 # Remove or set ALLOW_OPEN_SERVER=1 to bypass (not recommended).
@@ -1020,16 +1052,17 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
 
         # Auth — timing-safe to prevent timing attacks
         if BEARER_TOKEN:
-            auth        = request.headers.get("Authorization", "")
-            # NOTE: token query param is supported for Claude.ai compatibility.
-            # Be aware that query params may appear in server-side access logs.
-            # Rotate BEARER_TOKEN periodically and ensure Railway log access is restricted.
-            token_param = request.query_params.get("token", "")
-            expected    = f"Bearer {BEARER_TOKEN}"
+            auth     = request.headers.get("Authorization", "")
+            expected = f"Bearer {BEARER_TOKEN}"
 
-            # FIX: Guard against empty string comparison edge cases before compare_digest
             valid_header = bool(auth) and secrets.compare_digest(auth, expected)
-            valid_param  = bool(token_param) and secrets.compare_digest(token_param, BEARER_TOKEN)
+
+            # Query param token is opt-in (ALLOW_TOKEN_QUERY_PARAM=1) because the value
+            # appears in plain text in reverse-proxy access logs.
+            valid_param = False
+            if ALLOW_TOKEN_QUERY_PARAM:
+                token_param = request.query_params.get("token", "")
+                valid_param = bool(token_param) and secrets.compare_digest(token_param, BEARER_TOKEN)
 
             if not valid_header and not valid_param:
                 # FIX: Log path only (no query string) to avoid token leaking into logs
@@ -1047,6 +1080,10 @@ app.add_middleware(BearerAuthMiddleware)
 
 logger.info(f"Rate limit: {RATE_LIMIT_RPM} req/min per IP | Max tracked IPs: {_MAX_TRACKED_IPS} | Trusted proxies: {TRUSTED_PROXY_COUNT}")
 logger.info(f"Bearer auth: {'ENABLED' if BEARER_TOKEN else 'DISABLED — server is open (ALLOW_OPEN_SERVER set)'}")
+if ALLOW_TOKEN_QUERY_PARAM:
+    logger.warning("ALLOW_TOKEN_QUERY_PARAM=1 — token query param is ENABLED. Credentials may appear in proxy access logs.")
+else:
+    logger.info("Token query param: DISABLED (set ALLOW_TOKEN_QUERY_PARAM=1 to enable)")
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=PORT)
