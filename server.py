@@ -1019,12 +1019,20 @@ async def _is_rate_limited(ip: str) -> bool:
     now    = time.time()
     window = 60.0
     async with _rate_limit_lock:
-        # FIX: Evitar crecimiento ilimitado del dict — si se supera el límite de IPs
-        # trackeadas, simplemente se permite el request (fail-open) para no bloquear
-        # tráfico legítimo. Cambiar a `return True` para fail-closed si se prefiere.
         if ip not in _rate_limit_store and len(_rate_limit_store) >= _MAX_TRACKED_IPS:
-            logger.warning(f"Rate limit store full ({_MAX_TRACKED_IPS} IPs). Allowing request from {ip}.")
-            return False
+            # Before failing open, evict IPs whose entire sliding window has expired.
+            # This reclaims space from inactive or bot IPs without blocking legitimate traffic.
+            stale = [k for k, v in _rate_limit_store.items() if not v or now - max(v) >= window]
+            for k in stale:
+                del _rate_limit_store[k]
+            if len(_rate_limit_store) >= _MAX_TRACKED_IPS:
+                # Genuinely full after eviction — fail-open as last resort.
+                logger.warning(
+                    f"Rate limit store full after eviction ({_MAX_TRACKED_IPS} IPs tracked). "
+                    f"Allowing request from {ip} (fail-open)."
+                )
+                return False
+            logger.info(f"Rate limit store: evicted {len(stale)} stale entries, now {len(_rate_limit_store)} IPs tracked.")
 
         hits = _rate_limit_store[ip]
         _rate_limit_store[ip] = [t for t in hits if now - t < window]
