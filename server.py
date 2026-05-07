@@ -1,14 +1,4 @@
 #!/usr/bin/env python3
-"""
-Shopify MCP Server — Full Admin API access via FastMCP.
-Provides tools for managing products, orders, customers, collections,
-inventory, and fulfillments through the Shopify Admin REST API.
-
-Token Management:
-  - Uses client_credentials grant to auto-generate and refresh tokens
-  - Set SHOPIFY_CLIENT_ID + SHOPIFY_CLIENT_SECRET (recommended for OAuth apps)
-  - Falls back to static SHOPIFY_ACCESS_TOKEN if client credentials not set
-"""
 import json
 import os
 import logging
@@ -22,16 +12,8 @@ import nh3
 from pydantic import BaseModel, Field, ConfigDict, field_validator
 from mcp.server.fastmcp import FastMCP
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-
-SHOPIFY_STORE = os.environ.get("SHOPIFY_STORE", "")
-API_VERSION   = os.environ.get("SHOPIFY_API_VERSION", "2024-10")
-# Credentials are NOT stored as module globals — they are read from os.environ
-# only at the moment of use inside TokenManager to minimize secret lifetime in memory.
-
-# Refresh buffer: refresh token 30 minutes before expiry (only used with OAuth)
+SHOPIFY_STORE        = os.environ.get("SHOPIFY_STORE", "")
+API_VERSION          = os.environ.get("SHOPIFY_API_VERSION", "2024-10")
 TOKEN_REFRESH_BUFFER = int(os.environ.get("TOKEN_REFRESH_BUFFER", "1800"))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -44,21 +26,13 @@ MCP_TRANSPORT = os.environ.get("MCP_TRANSPORT", "streamable-http")
 
 mcp = FastMCP("shopify_mcp", host="0.0.0.0", port=PORT, json_response=True)
 
-# ---------------------------------------------------------------------------
-# Token Manager — handles automatic token lifecycle
-# ---------------------------------------------------------------------------
-
 class TokenManager:
     """
-    Manages Shopify Admin API access tokens.
-
     Two modes:
-      1. Static token  — set SHOPIFY_ACCESS_TOKEN (recommended for Custom Apps)
-      2. OAuth / client_credentials — set SHOPIFY_CLIENT_ID + SHOPIFY_CLIENT_SECRET
-         Enables auto-refresh before expiry and retry on 401.
+      1. Static — SHOPIFY_ACCESS_TOKEN
+      2. OAuth  — SHOPIFY_CLIENT_ID + SHOPIFY_CLIENT_SECRET (auto-refresh on expiry)
 
-    Credentials are read from os.environ at the point of use and are never stored
-    as instance attributes, minimising their lifetime in process memory.
+    Credentials are read from env at point of use, not stored as instance attributes.
     """
 
     def __init__(self, store: str, refresh_buffer: int = 1800):
@@ -69,8 +43,7 @@ class TokenManager:
         self._expires_at: float = 0.0
         self._lock = asyncio.Lock()
 
-        # Determine mode from env — store only the boolean flag, not the secrets.
-        client_id    = os.environ.get("SHOPIFY_CLIENT_ID", "")
+        client_id     = os.environ.get("SHOPIFY_CLIENT_ID", "")
         client_secret = os.environ.get("SHOPIFY_CLIENT_SECRET", "")
         static_token  = os.environ.get("SHOPIFY_ACCESS_TOKEN", "")
 
@@ -80,14 +53,13 @@ class TokenManager:
             logger.info("Token mode: client_credentials (auto-refresh enabled)")
         elif static_token:
             logger.info("Token mode: static SHOPIFY_ACCESS_TOKEN (no auto-refresh)")
-            self._access_token = static_token   # copied in; local var is discarded below
+            self._access_token = static_token
             self._expires_at   = float("inf")
         else:
             logger.warning(
                 "No credentials configured. Set SHOPIFY_ACCESS_TOKEN or "
                 "SHOPIFY_CLIENT_ID + SHOPIFY_CLIENT_SECRET."
             )
-        # client_id, client_secret, static_token go out of scope here — not kept on self
 
     @property
     def is_expired(self) -> bool:
@@ -124,7 +96,6 @@ class TokenManager:
         return self._access_token
 
     async def _refresh_token(self) -> None:
-        # Read credentials fresh from env on every refresh — not stored on the instance.
         client_id     = os.environ.get("SHOPIFY_CLIENT_ID", "")
         client_secret = os.environ.get("SHOPIFY_CLIENT_SECRET", "")
         if not client_id or not client_secret:
@@ -165,19 +136,13 @@ class TokenManager:
                 f"({expires_in // 3600}h {(expires_in % 3600) // 60}m). "
                 f"Scopes: {scope_preview}"
             )
-        # client_id and client_secret locals go out of scope here
 
 
-# Global token manager
 token_manager = TokenManager(
     store=SHOPIFY_STORE,
     refresh_buffer=TOKEN_REFRESH_BUFFER,
 )
 
-
-# ---------------------------------------------------------------------------
-# Shared helpers
-# ---------------------------------------------------------------------------
 
 def _base_url() -> str:
     return f"https://{SHOPIFY_STORE}.myshopify.com/admin/api/{API_VERSION}"
@@ -240,7 +205,6 @@ def _error(e: Exception) -> str:
             detail = e.response.json()
         except Exception:
             detail = e.response.text[:500]
-        # Full detail goes to server logs only — not exposed to the MCP caller.
         logger.error(f"Shopify API error {status}: {json.dumps(detail, default=str)}")
         messages = {
             401: "Authentication failed — check your SHOPIFY_ACCESS_TOKEN (should start with shpat_).",
@@ -261,10 +225,6 @@ def _error(e: Exception) -> str:
 def _fmt(data: Any) -> str:
     return json.dumps(data, indent=2, default=str)
 
-
-# ---------------------------------------------------------------------------
-# HTML sanitization — applied to body_html fields before sending to Shopify
-# ---------------------------------------------------------------------------
 
 _ALLOWED_HTML_TAGS = {
     "p", "br", "b", "i", "strong", "em", "u", "s",
@@ -979,9 +939,6 @@ async def shopify_create_webhook(params: CreateWebhookInput) -> str:
         return _error(e)
 
 
-# ---------------------------------------------------------------------------
-# Entrypoint
-# ---------------------------------------------------------------------------
 import sys
 import secrets
 import uvicorn
@@ -990,17 +947,13 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
 
-BEARER_TOKEN             = os.environ.get("BEARER_TOKEN", "")
-RATE_LIMIT_RPM           = int(os.environ.get("RATE_LIMIT_RPM", "60"))   # requests per minute per IP
-TRUSTED_PROXY_COUNT      = max(0, int(os.environ.get("TRUSTED_PROXY_COUNT", "1")))
-MAX_REQUEST_BODY         = int(os.environ.get("MAX_REQUEST_BODY", str(1 * 1024 * 1024)))  # 1 MB default
-# Token via query param (?token=) is disabled by default — it leaks credentials into
-# server-side access logs (nginx, Railway, etc.). Enable only if your MCP client
-# cannot send Authorization headers (e.g. some Claude.ai integrations).
-ALLOW_TOKEN_QUERY_PARAM  = os.environ.get("ALLOW_TOKEN_QUERY_PARAM", "").lower() in ("1", "true", "yes")
+BEARER_TOKEN            = os.environ.get("BEARER_TOKEN", "")
+RATE_LIMIT_RPM          = int(os.environ.get("RATE_LIMIT_RPM", "60"))
+TRUSTED_PROXY_COUNT     = max(0, int(os.environ.get("TRUSTED_PROXY_COUNT", "1")))
+MAX_REQUEST_BODY        = int(os.environ.get("MAX_REQUEST_BODY", str(1 * 1024 * 1024)))
+# Disabled by default: ?token= leaks credentials into reverse-proxy access logs.
+ALLOW_TOKEN_QUERY_PARAM = os.environ.get("ALLOW_TOKEN_QUERY_PARAM", "").lower() in ("1", "true", "yes")
 
-# FIX: Fail fast if BEARER_TOKEN is not set — prevents accidentally running open on production.
-# Remove or set ALLOW_OPEN_SERVER=1 to bypass (not recommended).
 if not BEARER_TOKEN and not os.environ.get("ALLOW_OPEN_SERVER"):
     logger.critical(
         "BEARER_TOKEN is not set. Refusing to start without authentication. "
@@ -1008,14 +961,9 @@ if not BEARER_TOKEN and not os.environ.get("ALLOW_OPEN_SERVER"):
     )
     sys.exit(1)
 
-# ---------------------------------------------------------------------------
-# In-process rate limiter — sliding window per IP
-# ---------------------------------------------------------------------------
 _rate_limit_store: Dict[str, List[float]] = defaultdict(list)
 _rate_limit_lock  = asyncio.Lock()
-
-# FIX: Cap tracked IPs to prevent unbounded memory growth from IP rotation / bots.
-_MAX_TRACKED_IPS = int(os.environ.get("RATE_LIMIT_MAX_IPS", "10000"))
+_MAX_TRACKED_IPS  = int(os.environ.get("RATE_LIMIT_MAX_IPS", "10000"))
 
 
 async def _is_rate_limited(ip: str) -> bool:
@@ -1023,13 +971,11 @@ async def _is_rate_limited(ip: str) -> bool:
     window = 60.0
     async with _rate_limit_lock:
         if ip not in _rate_limit_store and len(_rate_limit_store) >= _MAX_TRACKED_IPS:
-            # Before failing open, evict IPs whose entire sliding window has expired.
-            # This reclaims space from inactive or bot IPs without blocking legitimate traffic.
+            # Evict expired entries before failing open — reclaims space from bot IP rotation.
             stale = [k for k, v in _rate_limit_store.items() if not v or now - max(v) >= window]
             for k in stale:
                 del _rate_limit_store[k]
             if len(_rate_limit_store) >= _MAX_TRACKED_IPS:
-                # Genuinely full after eviction — fail-open as last resort.
                 logger.warning(
                     f"Rate limit store full after eviction ({_MAX_TRACKED_IPS} IPs tracked). "
                     f"Allowing request from {ip} (fail-open)."
@@ -1060,52 +1006,48 @@ def _get_client_ip(request: Request) -> str:
 
 
 class BearerAuthMiddleware(BaseHTTPMiddleware):
-    # MCP OAuth handshake endpoints — must be reachable before auth is established.
+    # These endpoints must be reachable before auth is established (MCP OAuth handshake).
     _PUBLIC_PREFIXES = (
-        "/.well-known/",  # OAuth discovery (RFC 8414)
-        "/register",      # Dynamic Client Registration (RFC 7591)
-        "/authorize",     # Authorization endpoint (RFC 6749)
-        "/token",         # Token endpoint (RFC 6749)
+        "/.well-known/",  # RFC 8414 — OAuth discovery
+        "/register",      # RFC 7591 — Dynamic Client Registration
+        "/authorize",     # RFC 6749 — Authorization endpoint
+        "/token",         # RFC 6749 — Token endpoint
     )
 
     async def dispatch(self, request: Request, call_next):
-        # Always allow MCP OAuth discovery endpoints
         if any(request.url.path.startswith(p) for p in self._PUBLIC_PREFIXES):
             return await call_next(request)
 
         ip = _get_client_ip(request)
 
-        # Reject oversized payloads early — before auth — to prevent OOM via large bodies
+        # Size check before auth — prevents OOM from oversized bodies on unauthenticated requests.
         content_length = request.headers.get("content-length")
         if content_length and int(content_length) > MAX_REQUEST_BODY:
             logger.warning(f"Payload too large from {ip}: {content_length} bytes (limit {MAX_REQUEST_BODY})")
             return Response("Payload Too Large", status_code=413)
 
-        # Rate limit — checked before auth to block brute-force attempts
+        # Rate limit before auth to block brute-force token guessing.
         if await _is_rate_limited(ip):
             logger.warning(f"Rate limit exceeded from {ip}")
             return Response("Too Many Requests", status_code=429,
                             headers={"Retry-After": "60"})
 
-        # Auth — timing-safe to prevent timing attacks
         if BEARER_TOKEN:
             auth     = request.headers.get("Authorization", "")
             expected = f"Bearer {BEARER_TOKEN}"
 
+            # compare_digest prevents timing attacks on token comparison.
             valid_header = bool(auth) and secrets.compare_digest(auth, expected)
 
-            # Query param token is opt-in (ALLOW_TOKEN_QUERY_PARAM=1) because the value
-            # appears in plain text in reverse-proxy access logs.
             valid_param = False
             if ALLOW_TOKEN_QUERY_PARAM:
+                # ?token= is opt-in because query params appear in reverse-proxy access logs.
                 token_param = request.query_params.get("token", "")
                 valid_param = bool(token_param) and secrets.compare_digest(token_param, BEARER_TOKEN)
 
             if not valid_header and not valid_param:
-                # FIX: Log path only (no query string) to avoid token leaking into logs
                 logger.warning(
-                    f"Unauthorized access attempt from {ip} "
-                    f"{request.method} {request.url.path}"  # intentionally omit query string
+                    f"Unauthorized from {ip} {request.method} {request.url.path}"  # no query string
                 )
                 return Response("Unauthorized", status_code=401)
 
@@ -1123,7 +1065,5 @@ else:
     logger.info("Token query param: DISABLED (set ALLOW_TOKEN_QUERY_PARAM=1 to enable)")
 
 if __name__ == "__main__":
-    # When token query param is enabled the full URL (including ?token=) appears in
-    # uvicorn's access log lines. Disable access_log so credentials don't land in
-    # Railway / reverse-proxy logs. Auth failures are still logged by BearerAuthMiddleware.
+    # Disable uvicorn access log when ?token= is active — it would log the full URL including the token.
     uvicorn.run(app, host="0.0.0.0", port=PORT, access_log=not ALLOW_TOKEN_QUERY_PARAM)

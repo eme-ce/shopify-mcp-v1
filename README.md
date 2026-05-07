@@ -75,7 +75,7 @@ pip install -r requirements.txt
 ### Configure your environment variables
 
 ```bash
-cp .env.example .env
+cp env.example .env
 ```
 
 Open `.env` and fill in your values:
@@ -83,9 +83,10 @@ Open `.env` and fill in your values:
 ```env
 SHOPIFY_STORE=your-store-name
 SHOPIFY_ACCESS_TOKEN=shpat_xxxxxxxxxxxxxxxxxxxx
+BEARER_TOKEN=pick-a-long-random-string-here
 ```
 
-> Only these two are required. Leave everything else as-is.
+> `SHOPIFY_STORE`, `SHOPIFY_ACCESS_TOKEN`, and `BEARER_TOKEN` are required. Leave everything else as-is.
 
 ### Run the server
 
@@ -97,6 +98,7 @@ You should see output like:
 
 ```
 INFO  Token mode: static SHOPIFY_ACCESS_TOKEN (no auto-refresh)
+INFO  Bearer auth: ENABLED
 INFO  Uvicorn running on http://0.0.0.0:8000
 ```
 
@@ -122,12 +124,14 @@ To use this server with Claude.ai, it needs a public URL. The easiest option is 
 
 In your Railway project, go to **Variables** and add the following:
 
-| Variable | Value |
-|---|---|
-| `SHOPIFY_STORE` | `your-store-name` |
-| `SHOPIFY_ACCESS_TOKEN` | `shpat_xxxxxxxxxxxxxxxxxxxx` |
-| `PORT` | `8000` |
-| `MCP_TRANSPORT` | `streamable-http` |
+| Variable | Required | Value |
+|---|---|---|
+| `SHOPIFY_STORE` | ✅ | `your-store-name` |
+| `SHOPIFY_ACCESS_TOKEN` | ✅ | `shpat_xxxxxxxxxxxxxxxxxxxx` |
+| `BEARER_TOKEN` | ✅ | A long random string — you'll enter this in Claude too |
+| `PORT` | No | `8000` |
+| `MCP_TRANSPORT` | No | `streamable-http` |
+| `ALLOW_TOKEN_QUERY_PARAM` | No | `1` — only if Claude.ai can't send Authorization headers |
 
 Railway restarts your server automatically after saving.
 
@@ -155,47 +159,7 @@ https://your-app.up.railway.app/mcp
 4. Fill in:
    - **Name:** `Shopify`
    - **URL:** `https://your-app.up.railway.app/mcp`
-5. For the **authentication token** field: leave it blank for now (your server does not require auth by default)
-
-> If you want to secure your server with an authentication token (recommended for production), see the section below.
-
-### Securing your server with a bearer token (recommended)
-
-By default, anyone who knows your Railway URL can access your MCP server. To protect it, add a bearer token.
-
-**Step 1 — Add a `BEARER_TOKEN` variable in Railway:**
-
-Go to Variables in Railway and add:
-
-```
-BEARER_TOKEN=pick-a-long-random-string-here
-```
-
-**Step 2 — Add auth middleware to `server.py`:**
-
-Add this block right after the line `mcp = FastMCP(...)`:
-
-```python
-import secrets
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.responses import Response
-
-BEARER_TOKEN = os.environ.get("BEARER_TOKEN", "")
-
-class BearerAuthMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request, call_next):
-        if BEARER_TOKEN:
-            auth = request.headers.get("Authorization", "")
-            if auth != f"Bearer {BEARER_TOKEN}":
-                return Response("Unauthorized", status_code=401)
-        return await call_next(request)
-
-mcp.app.add_middleware(BearerAuthMiddleware)
-```
-
-**Step 3 — Enter the token in Claude:**
-
-When adding the integration in Claude.ai, paste your `BEARER_TOKEN` value into the **authentication token** field.
+5. For the **authentication token** field: paste the value of your `BEARER_TOKEN` Railway variable
 
 ---
 
@@ -239,12 +203,18 @@ When adding the integration in Claude.ai, paste your `BEARER_TOKEN` value into t
 |---|---|---|---|
 | `SHOPIFY_STORE` | ✅ | — | Store name, e.g. `my-store` (not the full URL) |
 | `SHOPIFY_ACCESS_TOKEN` | ✅* | — | Admin API token from Custom App (`shpat_...`) |
+| `BEARER_TOKEN` | ✅ | — | Protects your MCP endpoint — set the same value in Claude |
 | `SHOPIFY_CLIENT_ID` | No | — | OAuth client ID (advanced, replaces static token) |
 | `SHOPIFY_CLIENT_SECRET` | No | — | OAuth client secret (advanced) |
-| `SHOPIFY_API_VERSION` | No | `2024-10` | Shopify Admin API version |
+| `SHOPIFY_API_VERSION` | No | `2025-01` | Shopify Admin API version |
 | `PORT` | No | `8000` | Port the server listens on |
 | `MCP_TRANSPORT` | No | `streamable-http` | Transport protocol |
-| `BEARER_TOKEN` | No | — | Protects your MCP endpoint (set in both Railway and Claude) |
+| `ALLOW_TOKEN_QUERY_PARAM` | No | — | Set to `1` only if your MCP client cannot send Authorization headers |
+| `MAX_REQUEST_BODY` | No | `1048576` | Max incoming request body in bytes (1 MB) |
+| `RATE_LIMIT_RPM` | No | `60` | Max requests per minute per IP |
+| `RATE_LIMIT_MAX_IPS` | No | `10000` | Max IPs tracked by the rate limiter |
+| `TRUSTED_PROXY_COUNT` | No | `1` | Number of reverse proxies in front of the server |
+| `TOKEN_REFRESH_BUFFER` | No | `1800` | Seconds before token expiry to trigger a refresh (OAuth mode) |
 
 *Either `SHOPIFY_ACCESS_TOKEN` **or** `SHOPIFY_CLIENT_ID` + `SHOPIFY_CLIENT_SECRET` is required.
 
