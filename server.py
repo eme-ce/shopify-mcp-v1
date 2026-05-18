@@ -1,30 +1,105 @@
 #!/usr/bin/env python3
 import json
 import os
+import sys
 import logging
 import time
 import asyncio
+import secrets
+from collections import deque
 from typing import Optional, List, Dict, Any
-from enum import Enum
 from urllib.parse import urlparse
+
 import httpx
 import nh3
 from pydantic import BaseModel, Field, ConfigDict, field_validator
 from mcp.server.fastmcp import FastMCP
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
-SHOPIFY_STORE        = os.environ.get("SHOPIFY_STORE", "")
-API_VERSION          = os.environ.get("SHOPIFY_API_VERSION", "2024-10")
-TOKEN_REFRESH_BUFFER = int(os.environ.get("TOKEN_REFRESH_BUFFER", "1800"))
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+SHOPIFY_STORE           = os.environ.get("SHOPIFY_STORE", "")
+API_VERSION             = os.environ.get("SHOPIFY_API_VERSION", "2025-01")
+PORT                    = int(os.environ.get("PORT", "8000"))
+BEARER_TOKEN            = os.environ.get("BEARER_TOKEN", "")
+ALLOW_TOKEN_QUERY_PARAM = os.environ.get("ALLOW_TOKEN_QUERY_PARAM", "").lower() in ("1", "true", "yes")
+MAX_REQUEST_BODY        = int(os.environ.get("MAX_REQUEST_BODY", str(1 * 1024 * 1024)))
+TOKEN_REFRESH_BUFFER    = int(os.environ.get("TOKEN_REFRESH_BUFFER", "1800"))
+
+_RATE_LIMIT_RPM  = int(os.environ.get("RATE_LIMIT_RPM", "60"))
+_MAX_TRACKED_IPS = int(os.environ.get("RATE_LIMIT_MAX_IPS", "10000"))
+_TRUSTED_PROXIES = max(0, int(os.environ.get("TRUSTED_PROXY_COUNT", "1")))
+
+# Applied to every outbound Shopify API call — prevents hanging workers when Shopify is slow.
+_SHOPIFY_TIMEOUT = httpx.Timeout(30.0)
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("shopify_mcp")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
-PORT          = int(os.environ.get("PORT", "8000"))
-MCP_TRANSPORT = os.environ.get("MCP_TRANSPORT", "streamable-http")
+# ---------------------------------------------------------------------------
+# Startup validation
+# ---------------------------------------------------------------------------
 
-mcp = FastMCP("shopify_mcp", host="0.0.0.0", port=PORT, json_response=True)
+if not BEARER_TOKEN and not os.environ.get("ALLOW_OPEN_SERVER"):
+    logger.critical(
+        "BEARER_TOKEN is not set. Refusing to start without authentication. "
+        "Set BEARER_TOKEN in your environment variables, or set ALLOW_OPEN_SERVER=1 to bypass (not recommended)."
+    )
+    sys.exit(1)
+
+# ---------------------------------------------------------------------------
+# Rate limiter (sliding window, in-process)
+# ---------------------------------------------------------------------------
+
+_rate_limit_store: dict[str, deque] = {}
+_rate_limit_lock = asyncio.Lock()
+
+
+async def _check_rate_limit(ip: str) -> bool:
+    now    = time.monotonic()
+    window = 60.0
+    async with _rate_limit_lock:
+        if ip not in _rate_limit_store:
+            if len(_rate_limit_store) >= _MAX_TRACKED_IPS:
+                # Evict expired entries before failing open — reclaims space from bot IP rotation.
+                stale = [k for k, v in _rate_limit_store.items() if not v or now - max(v) >= window]
+                for k in stale:
+                    del _rate_limit_store[k]
+                if len(_rate_limit_store) >= _MAX_TRACKED_IPS:
+                    logger.warning("rate-limit store full, failing open for %s", ip)
+                    return True
+            _rate_limit_store[ip] = deque()
+        dq = _rate_limit_store[ip]
+        while dq and now - dq[0] >= window:
+            dq.popleft()
+        if len(dq) >= _RATE_LIMIT_RPM:
+            return False
+        dq.append(now)
+        return True
+
+
+def _client_ip(request: Request) -> str:
+    xff = request.headers.get("x-forwarded-for", "")
+    if xff and _TRUSTED_PROXIES > 0:
+        parts = [p.strip() for p in xff.split(",")]
+        idx   = max(0, len(parts) - _TRUSTED_PROXIES)
+        return parts[idx]
+    return request.client.host if request.client else "unknown"
+
+
+# ---------------------------------------------------------------------------
+# Token manager
+# ---------------------------------------------------------------------------
 
 class TokenManager:
     """
@@ -39,8 +114,8 @@ class TokenManager:
         self._store          = store
         self._refresh_buffer = refresh_buffer
 
-        self._access_token: str = ""
-        self._expires_at: float = 0.0
+        self._access_token: str   = ""
+        self._expires_at:   float = 0.0
         self._lock = asyncio.Lock()
 
         client_id     = os.environ.get("SHOPIFY_CLIENT_ID", "")
@@ -67,22 +142,23 @@ class TokenManager:
             return True
         return time.time() >= (self._expires_at - self._refresh_buffer)
 
+    @property
+    def is_oauth_capable(self) -> bool:
+        return self._use_client_credentials
+
     async def get_token(self) -> str:
         if not self.is_expired:
             return self._access_token
-
         async with self._lock:
             if not self.is_expired:
                 return self._access_token
-
             if self._use_client_credentials:
-                await self._refresh_token()
+                await self._do_refresh()
             elif not self._access_token:
                 raise RuntimeError(
                     "No valid token available. "
                     "Set SHOPIFY_ACCESS_TOKEN in your environment variables."
                 )
-
         return self._access_token
 
     async def force_refresh(self) -> str:
@@ -92,10 +168,10 @@ class TokenManager:
                 "Set SHOPIFY_CLIENT_ID + SHOPIFY_CLIENT_SECRET to enable auto-refresh."
             )
         async with self._lock:
-            await self._refresh_token()
+            await self._do_refresh()
         return self._access_token
 
-    async def _refresh_token(self) -> None:
+    async def _do_refresh(self) -> None:
         client_id     = os.environ.get("SHOPIFY_CLIENT_ID", "")
         client_secret = os.environ.get("SHOPIFY_CLIENT_SECRET", "")
         if not client_id or not client_secret:
@@ -106,7 +182,7 @@ class TokenManager:
         url = f"https://{self._store}.myshopify.com/admin/oauth/access_token"
         logger.info("Refreshing Shopify access token via client_credentials grant...")
 
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=_SHOPIFY_TIMEOUT) as client:
             resp = await client.post(
                 url,
                 data={
@@ -115,10 +191,9 @@ class TokenManager:
                     "client_secret": client_secret,
                 },
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
-                timeout=15.0,
             )
             if resp.status_code != 200:
-                logger.error(f"Token refresh failed ({resp.status_code}): {resp.text[:500]}")
+                logger.error("Token refresh failed (%s): %s", resp.status_code, resp.text[:500])
                 raise RuntimeError(
                     f"Token refresh failed ({resp.status_code}). "
                     "Check SHOPIFY_CLIENT_ID and SHOPIFY_CLIENT_SECRET."
@@ -132,24 +207,23 @@ class TokenManager:
             scope         = data.get("scope", "")
             scope_preview = scope[:80] + "..." if len(scope) > 80 else scope
             logger.info(
-                f"Token refreshed. Expires in {expires_in}s "
-                f"({expires_in // 3600}h {(expires_in % 3600) // 60}m). "
-                f"Scopes: {scope_preview}"
+                "Token refreshed. Expires in %ds (%dh %dm). Scopes: %s",
+                expires_in, expires_in // 3600, (expires_in % 3600) // 60, scope_preview,
             )
 
 
-token_manager = TokenManager(
-    store=SHOPIFY_STORE,
-    refresh_buffer=TOKEN_REFRESH_BUFFER,
-)
+_token_manager = TokenManager(store=SHOPIFY_STORE, refresh_buffer=TOKEN_REFRESH_BUFFER)
 
+# ---------------------------------------------------------------------------
+# HTTP helpers
+# ---------------------------------------------------------------------------
 
 def _base_url() -> str:
     return f"https://{SHOPIFY_STORE}.myshopify.com/admin/api/{API_VERSION}"
 
 
 async def _headers() -> dict:
-    token = await token_manager.get_token()
+    token = await _token_manager.get_token()
     return {
         "X-Shopify-Access-Token": token,
         "Content-Type": "application/json",
@@ -173,23 +247,22 @@ async def _request(
         )
 
     if method in ("POST", "PUT", "PATCH", "DELETE") and not _retried:
-        logger.info(f"AUDIT {method} {path}")
+        logger.info("AUDIT %s %s", method, path)
 
     url     = f"{_base_url()}/{path}"
     headers = await _headers()
 
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=_SHOPIFY_TIMEOUT) as client:
         resp = await client.request(
             method, url,
             headers=headers,
             params=params,
             json=body,
-            timeout=30.0,
         )
 
-        if resp.status_code == 401 and not _retried and token_manager._use_client_credentials:
+        if resp.status_code == 401 and not _retried and _token_manager.is_oauth_capable:
             logger.warning("Got 401 from Shopify API — refreshing token and retrying...")
-            await token_manager.force_refresh()
+            await _token_manager.force_refresh()
             return await _request(method, path, params=params, body=body, _retried=True)
 
         resp.raise_for_status()
@@ -198,6 +271,10 @@ async def _request(
         return resp.json()
 
 
+# ---------------------------------------------------------------------------
+# Error handler + helpers
+# ---------------------------------------------------------------------------
+
 def _error(e: Exception) -> str:
     if isinstance(e, httpx.HTTPStatusError):
         status = e.response.status_code
@@ -205,7 +282,7 @@ def _error(e: Exception) -> str:
             detail = e.response.json()
         except Exception:
             detail = e.response.text[:500]
-        logger.error(f"Shopify API error {status}: {json.dumps(detail, default=str)}")
+        logger.error("Shopify API error %s: %s", status, json.dumps(detail, default=str))
         messages = {
             401: "Authentication failed — check your SHOPIFY_ACCESS_TOKEN (should start with shpat_).",
             403: "Permission denied — your token may be missing required API scopes.",
@@ -218,7 +295,7 @@ def _error(e: Exception) -> str:
         return "Request timed out — try again."
     if isinstance(e, RuntimeError):
         return str(e)
-    logger.error(f"Unexpected error: {type(e).__name__}: {e}")
+    logger.error("Unexpected error: %s: %s", type(e).__name__, e)
     return f"Unexpected error: {type(e).__name__}. Check server logs for details."
 
 
@@ -237,6 +314,13 @@ def _sanitize_html(value: Optional[str]) -> Optional[str]:
     if value is None:
         return None
     return nh3.clean(value, tags=_ALLOWED_HTML_TAGS)
+
+
+# ---------------------------------------------------------------------------
+# MCP server
+# ---------------------------------------------------------------------------
+
+mcp = FastMCP("shopify-mcp", host="0.0.0.0", port=PORT, json_response=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -939,71 +1023,9 @@ async def shopify_create_webhook(params: CreateWebhookInput) -> str:
         return _error(e)
 
 
-import sys
-import secrets
-import uvicorn
-from collections import defaultdict
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.requests import Request
-from starlette.responses import Response
-
-BEARER_TOKEN            = os.environ.get("BEARER_TOKEN", "")
-RATE_LIMIT_RPM          = int(os.environ.get("RATE_LIMIT_RPM", "60"))
-TRUSTED_PROXY_COUNT     = max(0, int(os.environ.get("TRUSTED_PROXY_COUNT", "1")))
-MAX_REQUEST_BODY        = int(os.environ.get("MAX_REQUEST_BODY", str(1 * 1024 * 1024)))
-# Disabled by default: ?token= leaks credentials into reverse-proxy access logs.
-ALLOW_TOKEN_QUERY_PARAM = os.environ.get("ALLOW_TOKEN_QUERY_PARAM", "").lower() in ("1", "true", "yes")
-
-if not BEARER_TOKEN and not os.environ.get("ALLOW_OPEN_SERVER"):
-    logger.critical(
-        "BEARER_TOKEN is not set. Refusing to start without authentication. "
-        "Set BEARER_TOKEN in your environment variables, or set ALLOW_OPEN_SERVER=1 to bypass (not recommended)."
-    )
-    sys.exit(1)
-
-_rate_limit_store: Dict[str, List[float]] = defaultdict(list)
-_rate_limit_lock  = asyncio.Lock()
-_MAX_TRACKED_IPS  = int(os.environ.get("RATE_LIMIT_MAX_IPS", "10000"))
-
-
-async def _is_rate_limited(ip: str) -> bool:
-    now    = time.time()
-    window = 60.0
-    async with _rate_limit_lock:
-        if ip not in _rate_limit_store and len(_rate_limit_store) >= _MAX_TRACKED_IPS:
-            # Evict expired entries before failing open — reclaims space from bot IP rotation.
-            stale = [k for k, v in _rate_limit_store.items() if not v or now - max(v) >= window]
-            for k in stale:
-                del _rate_limit_store[k]
-            if len(_rate_limit_store) >= _MAX_TRACKED_IPS:
-                logger.warning(
-                    f"Rate limit store full after eviction ({_MAX_TRACKED_IPS} IPs tracked). "
-                    f"Allowing request from {ip} (fail-open)."
-                )
-                return False
-            logger.info(f"Rate limit store: evicted {len(stale)} stale entries, now {len(_rate_limit_store)} IPs tracked.")
-
-        hits = _rate_limit_store[ip]
-        _rate_limit_store[ip] = [t for t in hits if now - t < window]
-        if len(_rate_limit_store[ip]) >= RATE_LIMIT_RPM:
-            return True
-        _rate_limit_store[ip].append(now)
-        return False
-
-
-def _get_client_ip(request: Request) -> str:
-    """Extract real client IP accounting for trusted reverse proxies.
-
-    Takes the IP just before the trusted proxy entries in X-Forwarded-For,
-    preventing IP spoofing via crafted headers.
-    """
-    forwarded = request.headers.get("x-forwarded-for", "")
-    if forwarded and TRUSTED_PROXY_COUNT > 0:
-        ips = [ip.strip() for ip in forwarded.split(",")]
-        idx = max(0, len(ips) - TRUSTED_PROXY_COUNT)
-        return ips[idx] if idx < len(ips) else (request.client.host if request.client else "unknown")
-    return request.client.host if request.client else "unknown"
-
+# ---------------------------------------------------------------------------
+# Auth middleware
+# ---------------------------------------------------------------------------
 
 class BearerAuthMiddleware(BaseHTTPMiddleware):
     # These endpoints must be reachable before auth is established (MCP OAuth handshake).
@@ -1015,55 +1037,89 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
     )
 
     async def dispatch(self, request: Request, call_next):
-        if any(request.url.path.startswith(p) for p in self._PUBLIC_PREFIXES):
+        path = request.url.path
+
+        # Health probe — unauthenticated.
+        if path == "/health":
+            return JSONResponse({"status": "ok"})
+
+        # OAuth metadata discovery — pass through to MCP SDK.
+        if any(path.startswith(p) for p in self._PUBLIC_PREFIXES):
             return await call_next(request)
 
-        ip = _get_client_ip(request)
+        ip = _client_ip(request)
 
         # Size check before auth — prevents OOM from oversized bodies on unauthenticated requests.
-        content_length = request.headers.get("content-length")
-        if content_length and int(content_length) > MAX_REQUEST_BODY:
-            logger.warning(f"Payload too large from {ip}: {content_length} bytes (limit {MAX_REQUEST_BODY})")
-            return Response("Payload Too Large", status_code=413)
+        content_length = int(request.headers.get("content-length", 0))
+        if content_length > MAX_REQUEST_BODY:
+            return JSONResponse({"error": "Request body too large"}, status_code=413)
 
         # Rate limit before auth to block brute-force token guessing.
-        if await _is_rate_limited(ip):
-            logger.warning(f"Rate limit exceeded from {ip}")
-            return Response("Too Many Requests", status_code=429,
-                            headers={"Retry-After": "60"})
+        if not await _check_rate_limit(ip):
+            return JSONResponse(
+                {"error": "Too many requests"},
+                status_code=429,
+                headers={"Retry-After": "60"},
+            )
 
         if BEARER_TOKEN:
-            auth     = request.headers.get("Authorization", "")
-            expected = f"Bearer {BEARER_TOKEN}"
+            token: str = ""
+            auth_header = request.headers.get("authorization", "")
+            if auth_header.lower().startswith("bearer "):
+                token = auth_header[7:]
+            elif ALLOW_TOKEN_QUERY_PARAM:
+                token = request.query_params.get("token", "")
 
-            # compare_digest prevents timing attacks on token comparison.
-            valid_header = bool(auth) and secrets.compare_digest(auth, expected)
-
-            valid_param = False
-            if ALLOW_TOKEN_QUERY_PARAM:
-                # ?token= is opt-in because query params appear in reverse-proxy access logs.
-                token_param = request.query_params.get("token", "")
-                valid_param = bool(token_param) and secrets.compare_digest(token_param, BEARER_TOKEN)
-
-            if not valid_header and not valid_param:
-                logger.warning(
-                    f"Unauthorized from {ip} {request.method} {request.url.path}"  # no query string
-                )
-                return Response("Unauthorized", status_code=401)
+            if not token or not secrets.compare_digest(token.encode(), BEARER_TOKEN.encode()):
+                logger.warning("Unauthorized attempt from %s %s %s", ip, request.method, path)
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
 
         return await call_next(request)
 
 
+class _HostRewriteMiddleware:
+    """Rewrite Host header to 'localhost' before the MCP SDK's DNS-rebinding check.
+    Railway terminates TLS and validates the real hostname upstream, so this is safe."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] in ("http", "websocket"):
+            scope = {
+                **scope,
+                "headers": [
+                    (b"host", b"localhost") if k == b"host" else (k, v)
+                    for k, v in scope.get("headers", [])
+                ],
+            }
+        await self.app(scope, receive, send)
+
+
+# Add middleware directly to FastMCP's app so its lifespan (session manager task group) is preserved.
 app = mcp.streamable_http_app()
 app.add_middleware(BearerAuthMiddleware)
+# _HostRewriteMiddleware is added last so it runs first (outermost) — it must rewrite before auth.
+app.add_middleware(_HostRewriteMiddleware)
 
-logger.info(f"Rate limit: {RATE_LIMIT_RPM} req/min per IP | Max tracked IPs: {_MAX_TRACKED_IPS} | Trusted proxies: {TRUSTED_PROXY_COUNT}")
-logger.info(f"Bearer auth: {'ENABLED' if BEARER_TOKEN else 'DISABLED — server is open (ALLOW_OPEN_SERVER set)'}")
-if ALLOW_TOKEN_QUERY_PARAM:
-    logger.warning("ALLOW_TOKEN_QUERY_PARAM=1 — token query param is ENABLED. Credentials may appear in proxy access logs.")
-else:
-    logger.info("Token query param: DISABLED (set ALLOW_TOKEN_QUERY_PARAM=1 to enable)")
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    import uvicorn
+
+    if not SHOPIFY_STORE:
+        logger.warning("SHOPIFY_STORE is not set")
+    if ALLOW_TOKEN_QUERY_PARAM:
+        logger.warning("ALLOW_TOKEN_QUERY_PARAM=1 — token query param is ENABLED. Credentials may appear in proxy access logs.")
+    else:
+        logger.info("Token query param: disabled")
+
+    logger.info("Bearer auth: %s", "ENABLED" if BEARER_TOKEN else "DISABLED")
+    logger.info("Rate limit: %d req/min per IP | Max tracked IPs: %d | Trusted proxies: %d",
+                _RATE_LIMIT_RPM, _MAX_TRACKED_IPS, _TRUSTED_PROXIES)
+    logger.info("MCP endpoint: http://0.0.0.0:%d/mcp", PORT)
+
     # Disable uvicorn access log when ?token= is active — it would log the full URL including the token.
     uvicorn.run(app, host="0.0.0.0", port=PORT, access_log=not ALLOW_TOKEN_QUERY_PARAM)
